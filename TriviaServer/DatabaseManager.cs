@@ -6,12 +6,14 @@ namespace TriviaServer
     public class DatabaseManager
     {
         private readonly string _connectionString;
+        private readonly PlayerProfileStore _profiles;
 
-        public DatabaseManager(IConfiguration configuration)
+        public DatabaseManager(IConfiguration configuration, PlayerProfileStore profiles)
         {
             _connectionString = configuration.GetConnectionString("SupabaseDb")
                 ?? throw new InvalidOperationException(
                     "Connection string 'SupabaseDb' is missing. Set it via user-secrets or an environment variable, see SETUP.md.");
+            _profiles = profiles;
         }
 
         private NpgsqlConnection CreateConnection() => new(_connectionString);
@@ -20,9 +22,6 @@ namespace TriviaServer
         // Questions
         // ---------------------------------------------------------------
 
-        // No LIMIT here on purpose: edit or add rows in the "Questions" table
-        // in Supabase and they show up next time the Unity client fetches
-        // this endpoint, with no rebuild needed.
         public async Task<List<Question>> GetQuestionsAsync()
         {
             var result = new List<Question>();
@@ -54,26 +53,26 @@ namespace TriviaServer
         // Matchmaking
         // ---------------------------------------------------------------
 
-        // Called when a player opens the game and wants to play.
-        // If someone is already waiting, this pairs them up immediately and
-        // both are marked in_match. Otherwise the caller becomes the one
-        // waiting player, and their client should poll GetMatchStatusForWaitingPlayerAsync.
-        public async Task<JoinResult> JoinMatchAsync(string name)
+        // Resolves (or creates) the player's Redis profile first, then pairs
+        // with whichever waiting player has the closest Elo.
+        public async Task<JoinResult> JoinMatchAsync(string? persistentPlayerId, string name)
         {
+            var (resolvedId, resolvedName, elo) = await _profiles.GetOrCreateAsync(persistentPlayerId, name);
+
             await using var connection = CreateConnection();
             await connection.OpenAsync();
             await using var tx = await connection.BeginTransactionAsync();
 
             try
             {
-                // FOR UPDATE SKIP LOCKED so two players joining at the exact
-                // same moment can't both grab the same waiting opponent.
                 int? opponentId = null;
                 await using (var findCmd = new NpgsqlCommand(
                     "SELECT id FROM players WHERE status = 'waiting' " +
-                    "ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+                    "ORDER BY ABS(elo_at_join - @myElo) ASC, created_at ASC " +
+                    "LIMIT 1 FOR UPDATE SKIP LOCKED",
                     connection, tx))
                 {
+                    findCmd.Parameters.AddWithValue("myElo", elo);
                     var found = await findCmd.ExecuteScalarAsync();
                     if (found != null) opponentId = (int)found;
                 }
@@ -81,13 +80,35 @@ namespace TriviaServer
                 if (opponentId == null)
                 {
                     await using var insertCmd = new NpgsqlCommand(
-                        "INSERT INTO players (name, status) VALUES (@name, 'waiting') RETURNING id",
+                        "INSERT INTO players (name, status, persistent_player_id, elo_at_join) " +
+                        "VALUES (@name, 'waiting', @pid, @elo) RETURNING id",
                         connection, tx);
-                    insertCmd.Parameters.AddWithValue("name", name);
+                    insertCmd.Parameters.AddWithValue("name", resolvedName);
+                    insertCmd.Parameters.AddWithValue("pid", resolvedId);
+                    insertCmd.Parameters.AddWithValue("elo", elo);
                     var newId = (int)(await insertCmd.ExecuteScalarAsync())!;
 
                     await tx.CommitAsync();
-                    return new JoinResult { Matched = false, PlayerId = newId };
+                    return new JoinResult
+                    {
+                        Matched = false,
+                        PlayerId = newId,
+                        PersistentPlayerId = resolvedId,
+                        MyElo = elo
+                    };
+                }
+
+                // Grab the opponent's display info before their row changes.
+                string opponentName;
+                int opponentElo;
+                await using (var opponentInfoCmd = new NpgsqlCommand(
+                    "SELECT name, elo_at_join FROM players WHERE id = @id", connection, tx))
+                {
+                    opponentInfoCmd.Parameters.AddWithValue("id", opponentId.Value);
+                    await using var reader = await opponentInfoCmd.ExecuteReaderAsync();
+                    await reader.ReadAsync();
+                    opponentName = reader.GetString(0);
+                    opponentElo = reader.GetInt32(1);
                 }
 
                 await using var matchCmd = new NpgsqlCommand(
@@ -97,10 +118,13 @@ namespace TriviaServer
                 var matchId = (int)(await matchCmd.ExecuteScalarAsync())!;
 
                 await using var insertSelfCmd = new NpgsqlCommand(
-                    "INSERT INTO players (name, status, match_id) VALUES (@name, 'in_match', @matchId) RETURNING id",
+                    "INSERT INTO players (name, status, match_id, persistent_player_id, elo_at_join) " +
+                    "VALUES (@name, 'in_match', @matchId, @pid, @elo) RETURNING id",
                     connection, tx);
-                insertSelfCmd.Parameters.AddWithValue("name", name);
+                insertSelfCmd.Parameters.AddWithValue("name", resolvedName);
                 insertSelfCmd.Parameters.AddWithValue("matchId", matchId);
+                insertSelfCmd.Parameters.AddWithValue("pid", resolvedId);
+                insertSelfCmd.Parameters.AddWithValue("elo", elo);
                 var selfId = (int)(await insertSelfCmd.ExecuteScalarAsync())!;
 
                 await using (var updateOpponentCmd = new NpgsqlCommand(
@@ -122,7 +146,16 @@ namespace TriviaServer
                 }
 
                 await tx.CommitAsync();
-                return new JoinResult { Matched = true, PlayerId = selfId, MatchId = matchId };
+                return new JoinResult
+                {
+                    Matched = true,
+                    PlayerId = selfId,
+                    MatchId = matchId,
+                    PersistentPlayerId = resolvedId,
+                    MyElo = elo,
+                    OpponentName = opponentName,
+                    OpponentElo = opponentElo
+                };
             }
             catch
             {
@@ -131,44 +164,76 @@ namespace TriviaServer
             }
         }
 
-        // The waiting player's client calls this every second or two until
-        // Matched becomes true.
+        // The waiting player's client polls this until Matched becomes true,
+        // at which point OpponentName/OpponentElo are also populated.
         public async Task<JoinResult> GetMatchStatusForWaitingPlayerAsync(int playerId)
         {
             await using var connection = CreateConnection();
             await connection.OpenAsync();
-            await using var cmd = new NpgsqlCommand(
-                "SELECT status, match_id FROM players WHERE id = @id", connection);
-            cmd.Parameters.AddWithValue("id", playerId);
-            await using var reader = await cmd.ExecuteReaderAsync();
 
-            if (!await reader.ReadAsync())
-                throw new KeyNotFoundException($"Player {playerId} not found.");
+            string status;
+            int? matchId;
+            string persistentId;
+            int myElo;
 
-            var status = reader.GetString(0);
-            var matchId = reader.IsDBNull(1) ? (int?)null : reader.GetInt32(1);
+            await using (var cmd = new NpgsqlCommand(
+                "SELECT status, match_id, persistent_player_id, elo_at_join FROM players WHERE id = @id",
+                connection))
+            {
+                cmd.Parameters.AddWithValue("id", playerId);
+                await using var reader = await cmd.ExecuteReaderAsync();
+                if (!await reader.ReadAsync())
+                    throw new KeyNotFoundException($"Player {playerId} not found.");
 
-            return new JoinResult
+                status = reader.GetString(0);
+                matchId = reader.IsDBNull(1) ? (int?)null : reader.GetInt32(1);
+                persistentId = reader.GetString(2);
+                myElo = reader.GetInt32(3);
+            }
+
+            var result = new JoinResult
             {
                 Matched = status != "waiting",
                 PlayerId = playerId,
-                MatchId = matchId
+                MatchId = matchId,
+                PersistentPlayerId = persistentId,
+                MyElo = myElo
             };
+
+            if (result.Matched && matchId != null)
+            {
+                await using var opponentCmd = new NpgsqlCommand(
+                    "SELECT name, elo_at_join FROM players WHERE match_id = @matchId AND id != @selfId",
+                    connection);
+                opponentCmd.Parameters.AddWithValue("matchId", matchId.Value);
+                opponentCmd.Parameters.AddWithValue("selfId", playerId);
+                await using var reader = await opponentCmd.ExecuteReaderAsync();
+                if (await reader.ReadAsync())
+                {
+                    result.OpponentName = reader.GetString(0);
+                    result.OpponentElo = reader.GetInt32(1);
+                }
+            }
+
+            return result;
         }
 
         // ---------------------------------------------------------------
         // Scoring
         // ---------------------------------------------------------------
 
-        // Called once, when a player finishes all their questions. Marks
-        // that player finished, and if the opponent is also finished,
-        // decides the winner right here (correct count, then total time,
-        // then tie) and closes out the match.
+        // Marks this player finished. Once both players in the match are
+        // finished, decides the winner, settles Elo for both (guarded so a
+        // retried request can't double-apply it), and writes the new
+        // ratings back to Redis.
         public async Task SubmitScoreAsync(int playerId, int correctCount, int totalTimeMs)
         {
             await using var connection = CreateConnection();
             await connection.OpenAsync();
             await using var tx = await connection.BeginTransactionAsync();
+
+            (string PersistentId, int NewElo)? p1EloUpdate = null;
+            (string PersistentId, int NewElo)? p2EloUpdate = null;
 
             try
             {
@@ -191,58 +256,99 @@ namespace TriviaServer
                     if (val != null && val != DBNull.Value) matchId = (int)val;
                 }
 
-                if (matchId != null)
+                if (matchId == null)
                 {
-                    var players = new List<(int Id, string Status, int Correct, int TimeMs)>();
-                    await using (var playersCmd = new NpgsqlCommand(
-                        "SELECT id, status, correct_count, total_time_ms FROM players WHERE match_id = @matchId",
-                        connection, tx))
+                    await tx.CommitAsync();
+                    return;
+                }
+
+                // Lock the match row and bail if it's already settled - this
+                // stops a retried/duplicate request from re-awarding Elo.
+                string matchStatus;
+                await using (var matchStatusCmd = new NpgsqlCommand(
+                    "SELECT status FROM matches WHERE id = @matchId FOR UPDATE", connection, tx))
+                {
+                    matchStatusCmd.Parameters.AddWithValue("matchId", matchId.Value);
+                    matchStatus = (string)(await matchStatusCmd.ExecuteScalarAsync())!;
+                }
+                if (matchStatus == "completed")
+                {
+                    await tx.CommitAsync();
+                    return;
+                }
+
+                var players = new List<(int Id, string Status, int Correct, int TimeMs, string PersistentId, int EloAtJoin)>();
+                await using (var playersCmd = new NpgsqlCommand(
+                    "SELECT id, status, correct_count, total_time_ms, persistent_player_id, elo_at_join " +
+                    "FROM players WHERE match_id = @matchId",
+                    connection, tx))
+                {
+                    playersCmd.Parameters.AddWithValue("matchId", matchId.Value);
+                    await using var reader = await playersCmd.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
                     {
-                        playersCmd.Parameters.AddWithValue("matchId", matchId.Value);
-                        await using var reader = await playersCmd.ExecuteReaderAsync();
-                        while (await reader.ReadAsync())
-                        {
-                            players.Add((
-                                reader.GetInt32(0),
-                                reader.GetString(1),
-                                reader.GetInt32(2),
-                                reader.GetInt32(3)));
-                        }
+                        players.Add((
+                            reader.GetInt32(0), reader.GetString(1), reader.GetInt32(2),
+                            reader.GetInt32(3), reader.GetString(4), reader.GetInt32(5)));
+                    }
+                }
+
+                if (players.Count == 2 && players.All(p => p.Status == "finished"))
+                {
+                    var p1 = players[0];
+                    var p2 = players[1];
+
+                    int? winnerId;
+                    bool isTie;
+                    if (p1.Correct != p2.Correct)
+                    {
+                        winnerId = p1.Correct > p2.Correct ? p1.Id : p2.Id;
+                        isTie = false;
+                    }
+                    else if (p1.TimeMs != p2.TimeMs)
+                    {
+                        winnerId = p1.TimeMs < p2.TimeMs ? p1.Id : p2.Id;
+                        isTie = false;
+                    }
+                    else
+                    {
+                        winnerId = null;
+                        isTie = true;
                     }
 
-                    if (players.Count == 2 && players.All(p => p.Status == "finished"))
+                    var p1Outcome = isTie ? EloOutcome.Tie : (winnerId == p1.Id ? EloOutcome.Win : EloOutcome.Loss);
+                    var p2Outcome = isTie ? EloOutcome.Tie : (winnerId == p2.Id ? EloOutcome.Win : EloOutcome.Loss);
+
+                    var p1NewElo = EloCalculator.CalculateNewRating(p1.EloAtJoin, p2.EloAtJoin, p1Outcome);
+                    var p2NewElo = EloCalculator.CalculateNewRating(p2.EloAtJoin, p1.EloAtJoin, p2Outcome);
+
+                    await using (var completeCmd = new NpgsqlCommand(
+                        "UPDATE matches SET status = 'completed', winner_id = @winner, is_tie = @tie, completed_at = now() WHERE id = @matchId",
+                        connection, tx))
                     {
-                        var p1 = players[0];
-                        var p2 = players[1];
-
-                        int? winnerId;
-                        bool isTie;
-
-                        if (p1.Correct != p2.Correct)
-                        {
-                            winnerId = p1.Correct > p2.Correct ? p1.Id : p2.Id;
-                            isTie = false;
-                        }
-                        else if (p1.TimeMs != p2.TimeMs)
-                        {
-                            // Same correct count -> the bonus tiebreak: faster total time wins.
-                            winnerId = p1.TimeMs < p2.TimeMs ? p1.Id : p2.Id;
-                            isTie = false;
-                        }
-                        else
-                        {
-                            winnerId = null;
-                            isTie = true;
-                        }
-
-                        await using var completeCmd = new NpgsqlCommand(
-                            "UPDATE matches SET status = 'completed', winner_id = @winner, is_tie = @tie, completed_at = now() WHERE id = @matchId",
-                            connection, tx);
                         completeCmd.Parameters.AddWithValue("winner", (object?)winnerId ?? DBNull.Value);
                         completeCmd.Parameters.AddWithValue("tie", isTie);
                         completeCmd.Parameters.AddWithValue("matchId", matchId.Value);
                         await completeCmd.ExecuteNonQueryAsync();
                     }
+
+                    await using (var eloCmd1 = new NpgsqlCommand(
+                        "UPDATE players SET elo_change = @change WHERE id = @id", connection, tx))
+                    {
+                        eloCmd1.Parameters.AddWithValue("change", p1NewElo - p1.EloAtJoin);
+                        eloCmd1.Parameters.AddWithValue("id", p1.Id);
+                        await eloCmd1.ExecuteNonQueryAsync();
+                    }
+                    await using (var eloCmd2 = new NpgsqlCommand(
+                        "UPDATE players SET elo_change = @change WHERE id = @id", connection, tx))
+                    {
+                        eloCmd2.Parameters.AddWithValue("change", p2NewElo - p2.EloAtJoin);
+                        eloCmd2.Parameters.AddWithValue("id", p2.Id);
+                        await eloCmd2.ExecuteNonQueryAsync();
+                    }
+
+                    p1EloUpdate = (p1.PersistentId, p1NewElo);
+                    p2EloUpdate = (p2.PersistentId, p2NewElo);
                 }
 
                 await tx.CommitAsync();
@@ -252,11 +358,16 @@ namespace TriviaServer
                 await tx.RollbackAsync();
                 throw;
             }
+
+            // Redis writes happen after the Postgres transaction commits,
+            // once the match is durably marked completed.
+            if (p1EloUpdate != null) await _profiles.UpdateEloAsync(p1EloUpdate.Value.PersistentId, p1EloUpdate.Value.NewElo);
+            if (p2EloUpdate != null) await _profiles.UpdateEloAsync(p2EloUpdate.Value.PersistentId, p2EloUpdate.Value.NewElo);
         }
 
         // Both clients poll this after submitting their own score, until
-        // Completed == true, then read WinnerId / IsTie / Players to show
-        // the result screen.
+        // Completed == true, then read WinnerId / IsTie / Players (including
+        // each player's EloChange/NewElo) to show the result screen.
         public async Task<MatchResult?> GetMatchResultAsync(int playerId)
         {
             await using var connection = CreateConnection();
@@ -279,7 +390,7 @@ namespace TriviaServer
 
             await using (var cmd = new NpgsqlCommand(
                 @"SELECT m.status, m.winner_id, m.is_tie,
-                         p.id, p.name, p.correct_count, p.total_time_ms
+                         p.id, p.name, p.correct_count, p.total_time_ms, p.elo_at_join, p.elo_change
                   FROM matches m
                   JOIN players p ON p.match_id = m.id
                   WHERE m.id = @matchId",
@@ -293,12 +404,17 @@ namespace TriviaServer
                     winnerId = reader.IsDBNull(1) ? null : reader.GetInt32(1);
                     isTie = reader.GetBoolean(2);
 
+                    var eloAtJoin = reader.GetInt32(7);
+                    int? eloChange = reader.IsDBNull(8) ? null : reader.GetInt32(8);
+
                     playerResults.Add(new PlayerResult
                     {
                         PlayerId = reader.GetInt32(3),
                         Name = reader.GetString(4),
                         CorrectCount = reader.GetInt32(5),
-                        TotalTimeMs = reader.GetInt32(6)
+                        TotalTimeMs = reader.GetInt32(6),
+                        EloChange = eloChange,
+                        NewElo = eloChange.HasValue ? eloAtJoin + eloChange.Value : null
                     });
                 }
             }

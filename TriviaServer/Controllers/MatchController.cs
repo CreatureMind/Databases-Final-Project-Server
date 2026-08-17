@@ -21,7 +21,7 @@ namespace TriviaServer.Controllers
         public async Task<ActionResult<JoinResult>> Join([FromBody] JoinRequest request)
         {
             var name = string.IsNullOrWhiteSpace(request.Name) ? "Player" : request.Name;
-            var result = await _db.JoinMatchAsync(name);
+            var result = await _db.JoinMatchAsync(request.PersistentPlayerId, name);
             return Ok(result);
         }
 
